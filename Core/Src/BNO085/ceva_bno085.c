@@ -14,6 +14,11 @@
 #define BNO085_RESET_DELAY_MS 10U
 #define BNO085_REPORT_INTERVAL_US 10000U
 #define BNO085_RAD_TO_DEG 57.29577951308232f
+#define BNO085_AUTO_AFTER_RESET_MS 150U
+#define BNO085_AUTO_AFTER_OPEN_MS 100U
+#define BNO085_AUTO_AFTER_CALLBACK_MS 100U
+#define BNO085_AUTO_AFTER_ENABLE_MS 50U
+#define BNO085_AUTO_RETRY_MS 1000U
 
 #define BNO085_CMD_RESET 1U
 #define BNO085_CMD_OPEN 2U
@@ -31,6 +36,8 @@ static uint8_t tx_zeros[SH2_HAL_MAX_TRANSFER_IN];
 static uint8_t rx_discard[SH2_HAL_MAX_TRANSFER_OUT];
 static bool sh2_is_open;
 static bool stream_enabled;
+static uint32_t auto_step;
+static uint32_t auto_next_ms;
 
 volatile uint32_t bno085_cmd;
 
@@ -85,6 +92,17 @@ static bool wait_for_int(void)
 
   update_io_debug();
   return true;
+}
+
+static bool tick_due(uint32_t deadline_ms)
+{
+  return (int32_t)(HAL_GetTick() - deadline_ms) >= 0;
+}
+
+static void auto_schedule(uint32_t next_step, uint32_t delay_ms)
+{
+  auto_step = next_step;
+  auto_next_ms = HAL_GetTick() + delay_ms;
 }
 
 static void hardware_reset(void)
@@ -245,7 +263,7 @@ static int hal_write(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len)
 
   if (!wait_for_int()) {
     bno085_dbg.tx_wait_timeout_count++;
-    return 0;
+    return SH2_ERR_TIMEOUT;
   }
 
   if (!spi_write_bytes(pBuffer, (uint16_t)len)) {
@@ -370,15 +388,22 @@ static void run_command(uint32_t cmd)
     bno085_dbg.cmd_status = SH2_OK;
     break;
 
-  case BNO085_CMD_OPEN:
+  case BNO085_CMD_OPEN: {
     if (sh2_is_open) {
       sh2_close();
       sh2_is_open = false;
     }
+    uint32_t reset_events_before = bno085_dbg.reset_event_count;
     bno085_dbg.open_status = sh2_open(&sh2_hal, event_callback, NULL);
+    if ((bno085_dbg.open_status == SH2_OK) &&
+        (bno085_dbg.reset_event_count == reset_events_before)) {
+      bno085_dbg.open_status = SH2_ERR_TIMEOUT;
+      sh2_close();
+    }
     sh2_is_open = bno085_dbg.open_status == SH2_OK;
     bno085_dbg.cmd_status = bno085_dbg.open_status;
     break;
+  }
 
   case BNO085_CMD_PROD:
     bno085_dbg.prod_status = sh2_getProdIds(&product_ids);
@@ -410,6 +435,73 @@ static void run_command(uint32_t cmd)
   }
 }
 
+static void run_auto_startup(void)
+{
+  if ((auto_step == 0U) || !tick_due(auto_next_ms)) {
+    return;
+  }
+
+  switch (auto_step) {
+  case BNO085_CMD_RESET:
+    run_command(BNO085_CMD_RESET);
+    auto_schedule(BNO085_CMD_OPEN, BNO085_AUTO_AFTER_RESET_MS);
+    break;
+
+  case BNO085_CMD_OPEN:
+    run_command(BNO085_CMD_OPEN);
+    if (bno085_dbg.cmd_status == SH2_OK) {
+      auto_schedule(BNO085_CMD_CALLBACK, BNO085_AUTO_AFTER_OPEN_MS);
+    } else {
+      auto_schedule(BNO085_CMD_RESET, BNO085_AUTO_RETRY_MS);
+    }
+    break;
+
+  case BNO085_CMD_CALLBACK:
+    if (!sh2_is_open) {
+      auto_schedule(BNO085_CMD_RESET, BNO085_AUTO_RETRY_MS);
+      break;
+    }
+    run_command(BNO085_CMD_CALLBACK);
+    if (bno085_dbg.cmd_status == SH2_OK) {
+      auto_schedule(BNO085_CMD_ENABLE_ARVR, BNO085_AUTO_AFTER_CALLBACK_MS);
+    } else {
+      auto_schedule(BNO085_CMD_CALLBACK, BNO085_AUTO_RETRY_MS);
+    }
+    break;
+
+  case BNO085_CMD_ENABLE_ARVR:
+    if (!sh2_is_open) {
+      auto_schedule(BNO085_CMD_RESET, BNO085_AUTO_RETRY_MS);
+      break;
+    }
+    if (!int_asserted()) {
+      bno085_dbg.stage = BNO085_CMD_ENABLE_ARVR;
+      bno085_dbg.enable_status = SH2_ERR_TIMEOUT;
+      bno085_dbg.cmd_status = SH2_ERR_TIMEOUT;
+      bno085_dbg.no_int_count++;
+      update_io_debug();
+      auto_schedule(BNO085_CMD_ENABLE_ARVR, BNO085_AUTO_RETRY_MS);
+      break;
+    }
+    run_command(BNO085_CMD_ENABLE_ARVR);
+    if (bno085_dbg.cmd_status == SH2_OK) {
+      auto_schedule(BNO085_CMD_STREAM_ON, BNO085_AUTO_AFTER_ENABLE_MS);
+    } else {
+      auto_schedule(BNO085_CMD_ENABLE_ARVR, BNO085_AUTO_RETRY_MS);
+    }
+    break;
+
+  case BNO085_CMD_STREAM_ON:
+    run_command(BNO085_CMD_STREAM_ON);
+    auto_schedule(0U, 0U);
+    break;
+
+  default:
+    auto_schedule(BNO085_CMD_RESET, BNO085_AUTO_RETRY_MS);
+    break;
+  }
+}
+
 void CEVA_BNO085_Init(void)
 {
   memset((void *)&bno085_dbg, 0, sizeof(bno085_dbg));
@@ -427,6 +519,9 @@ void CEVA_BNO085_Init(void)
 
   csn(true);
   rstn(true);
+  sh2_is_open = false;
+  stream_enabled = false;
+  auto_schedule(BNO085_CMD_RESET, 0U);
   update_io_debug();
 }
 
@@ -436,8 +531,11 @@ void CEVA_BNO085_Service(void)
 
   if (cmd != 0U) {
     bno085_cmd = 0U;
+    auto_schedule(0U, 0U);
     run_command(cmd);
   }
+
+  run_auto_startup();
 
   if (stream_enabled && sh2_is_open) {
     sh2_service();
