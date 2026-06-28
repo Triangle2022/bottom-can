@@ -1,0 +1,414 @@
+#include "ceva_bno085.h"
+
+#include <stdbool.h>
+#include <string.h>
+
+#include "main.h"
+#include "sh2_SensorValue.h"
+#include "sh2_err.h"
+#include "sh2_hal.h"
+
+#define BNO085_SPI_TIMEOUT_MS 100U
+#define BNO085_INT_TIMEOUT_MS 500U
+#define BNO085_RESET_DELAY_MS 10U
+#define BNO085_REPORT_INTERVAL_US 10000U
+
+#define BNO085_CMD_RESET 1U
+#define BNO085_CMD_OPEN 2U
+#define BNO085_CMD_PROD 3U
+#define BNO085_CMD_CALLBACK 4U
+#define BNO085_CMD_ENABLE_ARVR 5U
+#define BNO085_CMD_STREAM_ON 6U
+#define BNO085_CMD_STREAM_OFF 7U
+
+extern SPI_HandleTypeDef hspi2;
+
+static sh2_Hal_t sh2_hal;
+static sh2_ProductIds_t product_ids;
+static uint8_t tx_zeros[SH2_HAL_MAX_TRANSFER_IN];
+static uint8_t rx_discard[SH2_HAL_MAX_TRANSFER_OUT];
+static bool sh2_is_open;
+static bool stream_enabled;
+
+volatile uint32_t bno085_cmd;
+
+volatile ceva_bno085_debug_t bno085_dbg = {
+  .open_status = 999,
+  .prod_status = 999,
+  .enable_status = 999,
+  .decode_status = 999,
+  .cmd_status = 999,
+};
+
+static void csn(bool high)
+{
+  HAL_GPIO_WritePin(SPI2_CS_GPIO_Port, SPI2_CS_Pin,
+                    high ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static void rstn(bool high)
+{
+  HAL_GPIO_WritePin(SPI2_RST_GPIO_Port, SPI2_RST_Pin,
+                    high ? GPIO_PIN_SET : GPIO_PIN_RESET);
+}
+
+static uint32_t time_us(void)
+{
+  return HAL_GetTick() * 1000U;
+}
+
+static bool int_asserted(void)
+{
+  return HAL_GPIO_ReadPin(SPI2_INT_GPIO_Port, SPI2_INT_Pin) == GPIO_PIN_RESET;
+}
+
+static void update_io_debug(void)
+{
+  bno085_dbg.cmd = bno085_cmd;
+  bno085_dbg.int_pin = int_asserted() ? 0U : 1U;
+  bno085_dbg.rx_ready = int_asserted() ? 1U : 0U;
+}
+
+static bool wait_for_int(void)
+{
+  uint32_t start = HAL_GetTick();
+
+  while (!int_asserted()) {
+    if ((HAL_GetTick() - start) >= BNO085_INT_TIMEOUT_MS) {
+      bno085_dbg.no_int_count++;
+      update_io_debug();
+      return false;
+    }
+  }
+
+  update_io_debug();
+  return true;
+}
+
+static void hardware_reset(void)
+{
+  csn(true);
+  rstn(true);
+  HAL_Delay(BNO085_RESET_DELAY_MS);
+  rstn(false);
+  HAL_Delay(BNO085_RESET_DELAY_MS);
+  rstn(true);
+  HAL_Delay(BNO085_RESET_DELAY_MS);
+
+  bno085_dbg.reset_count++;
+  update_io_debug();
+}
+
+static void update_packet_debug(const uint8_t *packet, uint16_t packet_len)
+{
+  uint8_t channel;
+  uint8_t sequence;
+
+  if ((packet == NULL) || (packet_len < 4U)) {
+    return;
+  }
+
+  channel = packet[2];
+  sequence = packet[3];
+
+  bno085_dbg.last_packet_size = packet_len;
+  bno085_dbg.last_header0 = packet[0];
+  bno085_dbg.last_header1 = packet[1];
+  bno085_dbg.last_header2 = packet[2];
+  bno085_dbg.last_header3 = packet[3];
+  bno085_dbg.last_channel = channel;
+  bno085_dbg.last_sequence = sequence;
+  bno085_dbg.last_payload0 = (packet_len > 4U) ? packet[4] : 0U;
+  bno085_dbg.last_payload1 = (packet_len > 5U) ? packet[5] : 0U;
+  bno085_dbg.last_payload2 = (packet_len > 6U) ? packet[6] : 0U;
+  bno085_dbg.last_payload3 = (packet_len > 7U) ? packet[7] : 0U;
+
+  if (channel < 6U) {
+    bno085_dbg.channel_count[channel]++;
+  }
+
+  if ((bno085_dbg.read_count > 0U) &&
+      (bno085_dbg.last_sequence == sequence)) {
+    bno085_dbg.same_seq_count++;
+  } else {
+    bno085_dbg.new_seq_count++;
+  }
+}
+
+static bool spi_read_bytes(uint8_t *buffer, uint16_t len)
+{
+  HAL_StatusTypeDef status;
+
+  csn(false);
+  status = HAL_SPI_TransmitReceive(&hspi2, tx_zeros, buffer, len,
+                                   BNO085_SPI_TIMEOUT_MS);
+  csn(true);
+
+  if (status != HAL_OK) {
+    bno085_dbg.read_error_count++;
+    return false;
+  }
+
+  return true;
+}
+
+static bool spi_write_bytes(uint8_t *buffer, uint16_t len)
+{
+  HAL_StatusTypeDef status;
+
+  csn(false);
+  status = HAL_SPI_TransmitReceive(&hspi2, buffer, rx_discard, len,
+                                   BNO085_SPI_TIMEOUT_MS);
+  csn(true);
+
+  if (status != HAL_OK) {
+    bno085_dbg.write_error_count++;
+    return false;
+  }
+
+  return true;
+}
+
+static int hal_open(sh2_Hal_t *self)
+{
+  (void)self;
+
+  return wait_for_int() ? SH2_OK : SH2_ERR_IO;
+}
+
+static void hal_close(sh2_Hal_t *self)
+{
+  (void)self;
+
+  csn(true);
+  rstn(false);
+  sh2_is_open = false;
+  stream_enabled = false;
+  update_io_debug();
+}
+
+static int hal_read(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len,
+                    uint32_t *t_us)
+{
+  uint16_t packet_len;
+
+  (void)self;
+
+  if ((pBuffer == NULL) || (len < 4U)) {
+    return SH2_ERR_BAD_PARAM;
+  }
+
+  if (!wait_for_int()) {
+    return 0;
+  }
+
+  if (t_us != NULL) {
+    *t_us = time_us();
+  }
+
+  if (!spi_read_bytes(pBuffer, 4U)) {
+    return 0;
+  }
+
+  packet_len = ((uint16_t)pBuffer[0] | ((uint16_t)pBuffer[1] << 8)) &
+               (uint16_t)~0x8000U;
+
+  if ((packet_len < 4U) || (packet_len > len) ||
+      (packet_len > SH2_HAL_MAX_TRANSFER_IN)) {
+    bno085_dbg.bad_packet_count++;
+    return 0;
+  }
+
+  if (!wait_for_int()) {
+    return 0;
+  }
+
+  if (!spi_read_bytes(pBuffer, packet_len)) {
+    return 0;
+  }
+
+  update_packet_debug(pBuffer, packet_len);
+  bno085_dbg.read_count++;
+
+  return (int)packet_len;
+}
+
+static int hal_write(sh2_Hal_t *self, uint8_t *pBuffer, unsigned len)
+{
+  (void)self;
+
+  if ((pBuffer == NULL) || (len == 0U) || (len > SH2_HAL_MAX_TRANSFER_OUT)) {
+    return SH2_ERR_BAD_PARAM;
+  }
+
+  if (!wait_for_int()) {
+    bno085_dbg.tx_wait_timeout_count++;
+    return 0;
+  }
+
+  if (!spi_write_bytes(pBuffer, (uint16_t)len)) {
+    return 0;
+  }
+
+  bno085_dbg.write_count++;
+
+  return (int)len;
+}
+
+static uint32_t hal_get_time_us(sh2_Hal_t *self)
+{
+  (void)self;
+
+  return time_us();
+}
+
+static void event_callback(void *cookie, sh2_AsyncEvent_t *pEvent)
+{
+  (void)cookie;
+
+  if (pEvent == NULL) {
+    return;
+  }
+
+  if (pEvent->eventId == SH2_RESET) {
+    bno085_dbg.reset_event_count++;
+  } else if (pEvent->eventId == SH2_GET_FEATURE_RESP) {
+    bno085_dbg.get_feature_count++;
+  }
+}
+
+static void sensor_callback(void *cookie, sh2_SensorEvent_t *pEvent)
+{
+  sh2_SensorValue_t value;
+
+  (void)cookie;
+
+  if (pEvent == NULL) {
+    return;
+  }
+
+  bno085_dbg.callback_count++;
+  bno085_dbg.report_id = pEvent->reportId;
+  bno085_dbg.timestamp = pEvent->timestamp_uS;
+  bno085_dbg.decode_status = sh2_decodeSensorEvent(&value, pEvent);
+
+  if ((bno085_dbg.decode_status == SH2_OK) &&
+      (value.sensorId == SH2_ARVR_STABILIZED_RV)) {
+    bno085_dbg.accel_x = value.un.arvrStabilizedRV.i;
+    bno085_dbg.accel_y = value.un.arvrStabilizedRV.j;
+    bno085_dbg.accel_z = value.un.arvrStabilizedRV.k;
+  }
+}
+
+static int32_t enable_arvr(void)
+{
+  sh2_SensorConfig_t config = {0};
+
+  config.reportInterval_us = BNO085_REPORT_INTERVAL_US;
+
+  return sh2_setSensorConfig(SH2_ARVR_STABILIZED_RV, &config);
+}
+
+static void run_command(uint32_t cmd)
+{
+  bno085_dbg.stage = cmd;
+  bno085_dbg.cmd_status = 999;
+
+  switch (cmd) {
+  case BNO085_CMD_RESET:
+    hardware_reset();
+    bno085_dbg.cmd_status = SH2_OK;
+    break;
+
+  case BNO085_CMD_OPEN:
+    if (sh2_is_open) {
+      sh2_close();
+      sh2_is_open = false;
+    }
+    bno085_dbg.open_status = sh2_open(&sh2_hal, event_callback, NULL);
+    sh2_is_open = bno085_dbg.open_status == SH2_OK;
+    bno085_dbg.cmd_status = bno085_dbg.open_status;
+    break;
+
+  case BNO085_CMD_PROD:
+    bno085_dbg.prod_status = sh2_getProdIds(&product_ids);
+    bno085_dbg.cmd_status = bno085_dbg.prod_status;
+    break;
+
+  case BNO085_CMD_CALLBACK:
+    bno085_dbg.cmd_status = sh2_setSensorCallback(sensor_callback, NULL);
+    break;
+
+  case BNO085_CMD_ENABLE_ARVR:
+    bno085_dbg.enable_status = enable_arvr();
+    bno085_dbg.cmd_status = bno085_dbg.enable_status;
+    break;
+
+  case BNO085_CMD_STREAM_ON:
+    stream_enabled = true;
+    bno085_dbg.cmd_status = SH2_OK;
+    break;
+
+  case BNO085_CMD_STREAM_OFF:
+    stream_enabled = false;
+    bno085_dbg.cmd_status = SH2_OK;
+    break;
+
+  default:
+    bno085_dbg.cmd_status = SH2_ERR_BAD_PARAM;
+    break;
+  }
+}
+
+void CEVA_BNO085_Init(void)
+{
+  memset((void *)&bno085_dbg, 0, sizeof(bno085_dbg));
+  bno085_dbg.open_status = 999;
+  bno085_dbg.prod_status = 999;
+  bno085_dbg.enable_status = 999;
+  bno085_dbg.decode_status = 999;
+  bno085_dbg.cmd_status = 999;
+
+  sh2_hal.open = hal_open;
+  sh2_hal.close = hal_close;
+  sh2_hal.read = hal_read;
+  sh2_hal.write = hal_write;
+  sh2_hal.getTimeUs = hal_get_time_us;
+
+  csn(true);
+  rstn(true);
+  update_io_debug();
+}
+
+void CEVA_BNO085_Service(void)
+{
+  uint32_t cmd = bno085_cmd;
+
+  if (cmd != 0U) {
+    bno085_cmd = 0U;
+    run_command(cmd);
+  }
+
+  if (stream_enabled && sh2_is_open) {
+    sh2_service();
+    bno085_dbg.service_count++;
+  }
+
+  update_io_debug();
+}
+
+void CEVA_BNO085_EXTI_Callback(uint16_t gpio_pin)
+{
+  (void)gpio_pin;
+}
+
+void CEVA_BNO085_SPI_TxRxCpltCallback(void *hspi)
+{
+  (void)hspi;
+}
+
+void CEVA_BNO085_SPI_ErrorCallback(void *hspi)
+{
+  (void)hspi;
+  bno085_dbg.spi_error_count++;
+}
