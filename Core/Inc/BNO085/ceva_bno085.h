@@ -49,6 +49,13 @@ typedef struct {
   uint8_t last_payload3;
   uint8_t report_id;
   uint64_t timestamp;
+  float quat_i;
+  float quat_j;
+  float quat_k;
+  float quat_real;
+  float roll_deg;
+  float pitch_deg;
+  float yaw_deg;
   float accel_x;
   float accel_y;
   float accel_z;

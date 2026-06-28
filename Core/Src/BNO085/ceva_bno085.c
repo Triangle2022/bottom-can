@@ -1,5 +1,6 @@
 #include "ceva_bno085.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -12,6 +13,7 @@
 #define BNO085_INT_TIMEOUT_MS 500U
 #define BNO085_RESET_DELAY_MS 10U
 #define BNO085_REPORT_INTERVAL_US 10000U
+#define BNO085_RAD_TO_DEG 57.29577951308232f
 
 #define BNO085_CMD_RESET 1U
 #define BNO085_CMD_OPEN 2U
@@ -262,6 +264,32 @@ static uint32_t hal_get_time_us(sh2_Hal_t *self)
   return time_us();
 }
 
+static float clamp_float(float value, float min_value, float max_value)
+{
+  if (value < min_value) {
+    return min_value;
+  }
+  if (value > max_value) {
+    return max_value;
+  }
+
+  return value;
+}
+
+static void update_euler_from_quat(float i, float j, float k, float real)
+{
+  float sinr_cosp = 2.0f * ((real * i) + (j * k));
+  float cosr_cosp = 1.0f - (2.0f * ((i * i) + (j * j)));
+  float sinp = 2.0f * ((real * j) - (k * i));
+  float siny_cosp = 2.0f * ((real * k) + (i * j));
+  float cosy_cosp = 1.0f - (2.0f * ((j * j) + (k * k)));
+
+  bno085_dbg.roll_deg = atan2f(sinr_cosp, cosr_cosp) * BNO085_RAD_TO_DEG;
+  bno085_dbg.pitch_deg =
+      asinf(clamp_float(sinp, -1.0f, 1.0f)) * BNO085_RAD_TO_DEG;
+  bno085_dbg.yaw_deg = atan2f(siny_cosp, cosy_cosp) * BNO085_RAD_TO_DEG;
+}
+
 static void event_callback(void *cookie, sh2_AsyncEvent_t *pEvent)
 {
   (void)cookie;
@@ -292,21 +320,43 @@ static void sensor_callback(void *cookie, sh2_SensorEvent_t *pEvent)
   bno085_dbg.timestamp = pEvent->timestamp_uS;
   bno085_dbg.decode_status = sh2_decodeSensorEvent(&value, pEvent);
 
-  if ((bno085_dbg.decode_status == SH2_OK) &&
-      (value.sensorId == SH2_ARVR_STABILIZED_RV)) {
-    bno085_dbg.accel_x = value.un.arvrStabilizedRV.i;
-    bno085_dbg.accel_y = value.un.arvrStabilizedRV.j;
-    bno085_dbg.accel_z = value.un.arvrStabilizedRV.k;
+  if (bno085_dbg.decode_status != SH2_OK) {
+    return;
+  }
+
+  if (value.sensorId == SH2_ARVR_STABILIZED_RV) {
+    bno085_dbg.quat_i = value.un.arvrStabilizedRV.i;
+    bno085_dbg.quat_j = value.un.arvrStabilizedRV.j;
+    bno085_dbg.quat_k = value.un.arvrStabilizedRV.k;
+    bno085_dbg.quat_real = value.un.arvrStabilizedRV.real;
+    update_euler_from_quat(bno085_dbg.quat_i, bno085_dbg.quat_j,
+                           bno085_dbg.quat_k, bno085_dbg.quat_real);
+  } else if (value.sensorId == SH2_ACCELEROMETER) {
+    bno085_dbg.accel_x = value.un.accelerometer.x;
+    bno085_dbg.accel_y = value.un.accelerometer.y;
+    bno085_dbg.accel_z = value.un.accelerometer.z;
   }
 }
 
-static int32_t enable_arvr(void)
+static int32_t enable_report(sh2_SensorId_t sensor_id)
 {
   sh2_SensorConfig_t config = {0};
 
   config.reportInterval_us = BNO085_REPORT_INTERVAL_US;
 
-  return sh2_setSensorConfig(SH2_ARVR_STABILIZED_RV, &config);
+  return sh2_setSensorConfig(sensor_id, &config);
+}
+
+static int32_t enable_reports(void)
+{
+  int32_t status;
+
+  status = enable_report(SH2_ARVR_STABILIZED_RV);
+  if (status != SH2_OK) {
+    return status;
+  }
+
+  return enable_report(SH2_ACCELEROMETER);
 }
 
 static void run_command(uint32_t cmd)
@@ -340,7 +390,7 @@ static void run_command(uint32_t cmd)
     break;
 
   case BNO085_CMD_ENABLE_ARVR:
-    bno085_dbg.enable_status = enable_arvr();
+    bno085_dbg.enable_status = enable_reports();
     bno085_dbg.cmd_status = bno085_dbg.enable_status;
     break;
 
