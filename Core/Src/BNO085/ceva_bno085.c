@@ -343,6 +343,7 @@ static void sensor_callback(void *cookie, sh2_SensorEvent_t *pEvent)
   }
 
   if (value.sensorId == SH2_ARVR_STABILIZED_RV) {
+    bno085_dbg.rpy_count++;
     bno085_dbg.quat_i = value.un.arvrStabilizedRV.i;
     bno085_dbg.quat_j = value.un.arvrStabilizedRV.j;
     bno085_dbg.quat_k = value.un.arvrStabilizedRV.k;
@@ -350,6 +351,7 @@ static void sensor_callback(void *cookie, sh2_SensorEvent_t *pEvent)
     update_euler_from_quat(bno085_dbg.quat_i, bno085_dbg.quat_j,
                            bno085_dbg.quat_k, bno085_dbg.quat_real);
   } else if (value.sensorId == SH2_ACCELEROMETER) {
+    bno085_dbg.accel_count++;
     bno085_dbg.accel_x = value.un.accelerometer.x;
     bno085_dbg.accel_y = value.un.accelerometer.y;
     bno085_dbg.accel_z = value.un.accelerometer.z;

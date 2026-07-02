@@ -15,6 +15,8 @@ typedef struct {
   uint32_t write_count;
   uint32_t service_count;
   uint32_t callback_count;
+  uint32_t rpy_count;
+  uint32_t accel_count;
   uint32_t no_int_count;
   uint32_t read_error_count;
   uint32_t write_error_count;

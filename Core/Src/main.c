@@ -32,6 +32,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define BOTTOM_CAN_TX_PERIOD_MS 10U
+#define BOTTOM_CAN_ID_RPY      0x210U
+#define BOTTOM_CAN_ID_ACCEL    0x211U
 
 /* USER CODE END PD */
 
@@ -48,6 +51,8 @@ FDCAN_HandleTypeDef hfdcan1;
 SPI_HandleTypeDef hspi2;
 
 /* USER CODE BEGIN PV */
+static uint32_t bottom_can_last_tx_ms;
+static uint8_t bottom_can_tx_seq;
 
 /* USER CODE END PV */
 
@@ -57,6 +62,8 @@ static void MX_GPIO_Init(void);
 static void MX_FDCAN1_Init(void);
 static void MX_SPI2_Init(void);
 /* USER CODE BEGIN PFP */
+static void Bottom_CAN_Init(void);
+static void Bottom_CAN_Service(void);
 
 /* USER CODE END PFP */
 
@@ -97,6 +104,7 @@ int main(void)
   MX_FDCAN1_Init();
   MX_SPI2_Init();
   /* USER CODE BEGIN 2 */
+  Bottom_CAN_Init();
   CEVA_BNO085_Init();
 
   /* USER CODE END 2 */
@@ -127,6 +135,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     CEVA_BNO085_Service();
+    Bottom_CAN_Service();
   }
   /* USER CODE END 3 */
 }
@@ -196,13 +205,13 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
   hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC;
   hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = DISABLE;
+  hfdcan1.Init.AutoRetransmission = ENABLE;
   hfdcan1.Init.TransmitPause = DISABLE;
   hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 16;
-  hfdcan1.Init.NominalSyncJumpWidth = 1;
-  hfdcan1.Init.NominalTimeSeg1 = 1;
-  hfdcan1.Init.NominalTimeSeg2 = 1;
+  hfdcan1.Init.NominalPrescaler = 10;
+  hfdcan1.Init.NominalSyncJumpWidth = 3;
+  hfdcan1.Init.NominalTimeSeg1 = 13;
+  hfdcan1.Init.NominalTimeSeg2 = 3;
   hfdcan1.Init.DataPrescaler = 1;
   hfdcan1.Init.DataSyncJumpWidth = 1;
   hfdcan1.Init.DataTimeSeg1 = 1;
@@ -306,6 +315,116 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static int16_t clamp_i16(int32_t value)
+{
+  if (value > 32767) {
+    return 32767;
+  }
+  if (value < -32768) {
+    return -32768;
+  }
+
+  return (int16_t)value;
+}
+
+static int16_t scale_i16(float value, float scale)
+{
+  float scaled = value * scale;
+
+  if (scaled >= 0.0f) {
+    scaled += 0.5f;
+  } else {
+    scaled -= 0.5f;
+  }
+
+  return clamp_i16((int32_t)scaled);
+}
+
+static void put_i16_be(uint8_t *buffer, uint32_t offset, int16_t value)
+{
+  uint16_t raw = (uint16_t)value;
+
+  buffer[offset] = (uint8_t)(raw >> 8);
+  buffer[offset + 1U] = (uint8_t)(raw & 0xFFU);
+}
+
+static uint8_t read_limit_bits(void)
+{
+  uint8_t bits = 0U;
+
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW1_1_GPIO_Port, LIMIT_SW1_1_Pin) == GPIO_PIN_SET) ? 0x01U : 0U;
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW1_2_GPIO_Port, LIMIT_SW1_2_Pin) == GPIO_PIN_SET) ? 0x02U : 0U;
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW2_1_GPIO_Port, LIMIT_SW2_1_Pin) == GPIO_PIN_SET) ? 0x04U : 0U;
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW2_2_GPIO_Port, LIMIT_SW2_2_Pin) == GPIO_PIN_SET) ? 0x08U : 0U;
+
+  return bits;
+}
+
+static HAL_StatusTypeDef bottom_can_send(uint32_t std_id, const uint8_t data[8])
+{
+  FDCAN_TxHeaderTypeDef tx_header = {0};
+
+  if (HAL_FDCAN_GetTxFifoFreeLevel(&hfdcan1) == 0U) {
+    return HAL_BUSY;
+  }
+
+  tx_header.Identifier = std_id;
+  tx_header.IdType = FDCAN_STANDARD_ID;
+  tx_header.TxFrameType = FDCAN_DATA_FRAME;
+  tx_header.DataLength = FDCAN_DLC_BYTES_8;
+  tx_header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  tx_header.BitRateSwitch = FDCAN_BRS_OFF;
+  tx_header.FDFormat = FDCAN_CLASSIC_CAN;
+  tx_header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  tx_header.MessageMarker = 0U;
+
+  return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &tx_header, (uint8_t *)data);
+}
+
+static void Bottom_CAN_Init(void)
+{
+  if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
+    Error_Handler();
+  }
+
+  bottom_can_last_tx_ms = HAL_GetTick();
+}
+
+static void Bottom_CAN_Service(void)
+{
+  uint32_t now_ms = HAL_GetTick();
+  uint8_t limits;
+  uint8_t rpy_data[8] = {0};
+  uint8_t accel_data[8] = {0};
+
+  if ((now_ms - bottom_can_last_tx_ms) < BOTTOM_CAN_TX_PERIOD_MS) {
+    return;
+  }
+  bottom_can_last_tx_ms = now_ms;
+
+  limits = read_limit_bits();
+
+  if (bno085_dbg.rpy_count > 0U) {
+    put_i16_be(rpy_data, 0U, scale_i16(bno085_dbg.roll_deg, 100.0f));
+    put_i16_be(rpy_data, 2U, scale_i16(bno085_dbg.pitch_deg, 100.0f));
+    put_i16_be(rpy_data, 4U, scale_i16(bno085_dbg.yaw_deg, 100.0f));
+    rpy_data[6] = limits;
+    rpy_data[7] = bottom_can_tx_seq;
+    (void)bottom_can_send(BOTTOM_CAN_ID_RPY, rpy_data);
+  }
+
+  if (bno085_dbg.accel_count > 0U) {
+    put_i16_be(accel_data, 0U, scale_i16(bno085_dbg.accel_x, 1000.0f));
+    put_i16_be(accel_data, 2U, scale_i16(bno085_dbg.accel_y, 1000.0f));
+    put_i16_be(accel_data, 4U, scale_i16(bno085_dbg.accel_z, 1000.0f));
+    accel_data[6] = limits;
+    accel_data[7] = bno085_dbg.report_id;
+    (void)bottom_can_send(BOTTOM_CAN_ID_ACCEL, accel_data);
+  }
+
+  bottom_can_tx_seq++;
+}
+
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   CEVA_BNO085_EXTI_Callback(GPIO_Pin);
