@@ -35,6 +35,11 @@
 #define BOTTOM_CAN_TX_PERIOD_MS 10U
 #define BOTTOM_CAN_ID_RPY      0x210U
 #define BOTTOM_CAN_ID_ACCEL    0x211U
+#define BOTTOM_CAN_ID_COMMAND  0x212U
+#define BOTTOM_CAN_ID_STATUS   0x213U
+#define BOTTOM_CAN_CMD_RELAY   0x01U
+#define BOTTOM_RELAY_ON_LEVEL  GPIO_PIN_SET
+#define BOTTOM_RELAY_OFF_LEVEL GPIO_PIN_RESET
 
 /* USER CODE END PD */
 
@@ -53,6 +58,7 @@ SPI_HandleTypeDef hspi2;
 /* USER CODE BEGIN PV */
 static uint32_t bottom_can_last_tx_ms;
 static uint8_t bottom_can_tx_seq;
+static uint8_t bottom_can_relay_state;
 
 /* USER CODE END PV */
 
@@ -64,6 +70,7 @@ static void MX_SPI2_Init(void);
 /* USER CODE BEGIN PFP */
 static void Bottom_CAN_Init(void);
 static void Bottom_CAN_Service(void);
+static void Bottom_CAN_ProcessRx(void);
 
 /* USER CODE END PFP */
 
@@ -216,7 +223,7 @@ static void MX_FDCAN1_Init(void)
   hfdcan1.Init.DataSyncJumpWidth = 1;
   hfdcan1.Init.DataTimeSeg1 = 1;
   hfdcan1.Init.DataTimeSeg2 = 1;
-  hfdcan1.Init.StdFiltersNbr = 0;
+  hfdcan1.Init.StdFiltersNbr = 1;
   hfdcan1.Init.ExtFiltersNbr = 0;
   hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
   if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
@@ -288,7 +295,17 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(BRAKE_GPIO_Port, BRAKE_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, SPI2_RST_Pin|SPI2_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin : BRAKE_Pin */
+  GPIO_InitStruct.Pin = BRAKE_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(BRAKE_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : SPI2_RST_Pin SPI2_CS_Pin */
   GPIO_InitStruct.Pin = SPI2_RST_Pin|SPI2_CS_Pin;
@@ -306,7 +323,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pins : LIMIT_SW1_1_Pin LIMIT_SW1_2_Pin LIMIT_SW2_1_Pin LIMIT_SW2_2_Pin */
   GPIO_InitStruct.Pin = LIMIT_SW1_1_Pin|LIMIT_SW1_2_Pin|LIMIT_SW2_1_Pin|LIMIT_SW2_2_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -352,12 +369,19 @@ static uint8_t read_limit_bits(void)
 {
   uint8_t bits = 0U;
 
-  bits |= (HAL_GPIO_ReadPin(LIMIT_SW1_1_GPIO_Port, LIMIT_SW1_1_Pin) == GPIO_PIN_SET) ? 0x01U : 0U;
-  bits |= (HAL_GPIO_ReadPin(LIMIT_SW1_2_GPIO_Port, LIMIT_SW1_2_Pin) == GPIO_PIN_SET) ? 0x02U : 0U;
-  bits |= (HAL_GPIO_ReadPin(LIMIT_SW2_1_GPIO_Port, LIMIT_SW2_1_Pin) == GPIO_PIN_SET) ? 0x04U : 0U;
-  bits |= (HAL_GPIO_ReadPin(LIMIT_SW2_2_GPIO_Port, LIMIT_SW2_2_Pin) == GPIO_PIN_SET) ? 0x08U : 0U;
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW1_1_GPIO_Port, LIMIT_SW1_1_Pin) == GPIO_PIN_RESET) ? 0x01U : 0U;
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW1_2_GPIO_Port, LIMIT_SW1_2_Pin) == GPIO_PIN_RESET) ? 0x02U : 0U;
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW2_1_GPIO_Port, LIMIT_SW2_1_Pin) == GPIO_PIN_RESET) ? 0x04U : 0U;
+  bits |= (HAL_GPIO_ReadPin(LIMIT_SW2_2_GPIO_Port, LIMIT_SW2_2_Pin) == GPIO_PIN_RESET) ? 0x08U : 0U;
 
   return bits;
+}
+
+static void set_relay_state(uint8_t state)
+{
+  bottom_can_relay_state = (state != 0U) ? 1U : 0U;
+  HAL_GPIO_WritePin(BRAKE_GPIO_Port, BRAKE_Pin,
+                    (bottom_can_relay_state != 0U) ? BOTTOM_RELAY_ON_LEVEL : BOTTOM_RELAY_OFF_LEVEL);
 }
 
 static HAL_StatusTypeDef bottom_can_send(uint32_t std_id, const uint8_t data[8])
@@ -383,11 +407,59 @@ static HAL_StatusTypeDef bottom_can_send(uint32_t std_id, const uint8_t data[8])
 
 static void Bottom_CAN_Init(void)
 {
+  FDCAN_FilterTypeDef rx_filter = {0};
+
+  rx_filter.IdType = FDCAN_STANDARD_ID;
+  rx_filter.FilterIndex = 0U;
+  rx_filter.FilterType = FDCAN_FILTER_MASK;
+  rx_filter.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+  rx_filter.FilterID1 = BOTTOM_CAN_ID_COMMAND;
+  rx_filter.FilterID2 = 0x7FFU;
+
+  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &rx_filter) != HAL_OK) {
+    Error_Handler();
+  }
+
+  if (HAL_FDCAN_ConfigGlobalFilter(&hfdcan1, FDCAN_REJECT, FDCAN_REJECT,
+                                   FDCAN_REJECT_REMOTE, FDCAN_REJECT_REMOTE) != HAL_OK) {
+    Error_Handler();
+  }
+
+  set_relay_state(0U);
+
   if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK) {
     Error_Handler();
   }
 
   bottom_can_last_tx_ms = HAL_GetTick();
+}
+
+static void Bottom_CAN_HandleCommand(const FDCAN_RxHeaderTypeDef *rx_header, const uint8_t data[8])
+{
+  if ((rx_header->IdType != FDCAN_STANDARD_ID) ||
+      (rx_header->Identifier != BOTTOM_CAN_ID_COMMAND) ||
+      (rx_header->RxFrameType != FDCAN_DATA_FRAME) ||
+      (rx_header->DataLength != FDCAN_DLC_BYTES_8)) {
+    return;
+  }
+
+  if (data[0] == BOTTOM_CAN_CMD_RELAY) {
+    set_relay_state(data[1]);
+  }
+}
+
+static void Bottom_CAN_ProcessRx(void)
+{
+  FDCAN_RxHeaderTypeDef rx_header;
+  uint8_t rx_data[8];
+
+  while (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) > 0U) {
+    if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rx_header, rx_data) != HAL_OK) {
+      return;
+    }
+
+    Bottom_CAN_HandleCommand(&rx_header, rx_data);
+  }
 }
 
 static void Bottom_CAN_Service(void)
@@ -396,6 +468,9 @@ static void Bottom_CAN_Service(void)
   uint8_t limits;
   uint8_t rpy_data[8] = {0};
   uint8_t accel_data[8] = {0};
+  uint8_t status_data[8] = {0};
+
+  Bottom_CAN_ProcessRx();
 
   if ((now_ms - bottom_can_last_tx_ms) < BOTTOM_CAN_TX_PERIOD_MS) {
     return;
@@ -421,6 +496,12 @@ static void Bottom_CAN_Service(void)
     accel_data[7] = bno085_dbg.report_id;
     (void)bottom_can_send(BOTTOM_CAN_ID_ACCEL, accel_data);
   }
+
+  status_data[0] = limits;
+  status_data[1] = bottom_can_relay_state;
+  status_data[2] = bno085_dbg.rx_ready;
+  status_data[7] = bottom_can_tx_seq;
+  (void)bottom_can_send(BOTTOM_CAN_ID_STATUS, status_data);
 
   bottom_can_tx_seq++;
 }

@@ -8,7 +8,8 @@ The firmware:
 - enables ARVR stabilized rotation vector and accelerometer reports
 - converts quaternion to roll/pitch/yaw
 - reads four limit switch inputs
-- sends two Classic CAN frames at 1 Mbps
+- controls the PB1 brake/relay output from a CAN command frame
+- sends Classic CAN telemetry/status frames at 1 Mbps
 
 ## Hardware
 
@@ -45,6 +46,12 @@ PC6 = LIMIT_SW1_1
 PC7 = LIMIT_SW1_2
 PC8 = LIMIT_SW2_1
 PC9 = LIMIT_SW2_2
+```
+
+Brake/relay output:
+
+```text
+PB1 = BRAKE
 ```
 
 Important: PA11/PA12 are CAN controller pins, not CANH/CANL. Use a CAN transceiver between the STM32 and the CAN bus.
@@ -148,6 +155,38 @@ byte  6:    limit bitfield
 byte  7:    BNO085 report_id
 ```
 
+ID `0x212`, 8 bytes, RX command:
+
+```text
+byte 0: command
+byte 1: value
+bytes 2..7: reserved
+```
+
+Supported commands:
+
+```text
+command 0x01, value 0x00: brake/relay OFF
+command 0x01, value 0x01: brake/relay ON
+```
+
+Example command frames:
+
+```text
+0x212 [01 01 00 00 00 00 00 00]  PB1/BRAKE ON
+0x212 [01 00 00 00 00 00 00 00]  PB1/BRAKE OFF
+```
+
+ID `0x213`, 8 bytes, TX status:
+
+```text
+byte  0: limit bitfield
+byte  1: brake/relay state, 0 OFF / 1 ON
+byte  2: BNO085 rx_ready
+bytes 3..6: reserved
+byte  7: sequence
+```
+
 Limit bits:
 
 ```text
@@ -156,6 +195,45 @@ bit1 = LIMIT_SW1_2
 bit2 = LIMIT_SW2_1
 bit3 = LIMIT_SW2_2
 ```
+
+The limit inputs use pull-ups, so the firmware reports a limit bit as `1` when the corresponding GPIO reads `GPIO_PIN_RESET`.
+
+## Live Expressions Debug
+
+Useful STM32CubeIDE Live Expressions:
+
+```text
+bottom_can_relay_state
+bottom_can_tx_seq
+bno085_dbg.rx_ready
+bno085_dbg.rpy_count
+bno085_dbg.accel_count
+```
+
+`bottom_can_relay_state` is a state mirror only. Changing it directly in Live Expressions changes the variable value, but it does not call `HAL_GPIO_WritePin()`, so PB1 may not change.
+
+To test the actual PB1 relay output, send the `0x212` CAN command frame instead:
+
+```text
+0x212 [01 01 00 00 00 00 00 00]  relay ON
+0x212 [01 00 00 00 00 00 00 00]  relay OFF
+```
+
+Expected Live Expressions result:
+
+```text
+relay ON command  -> bottom_can_relay_state = 1
+relay OFF command -> bottom_can_relay_state = 0
+```
+
+The relay output is active-high by default:
+
+```text
+bottom_can_relay_state = 1 -> PB1 HIGH
+bottom_can_relay_state = 0 -> PB1 LOW
+```
+
+If the relay module is active-low, swap `BOTTOM_RELAY_ON_LEVEL` and `BOTTOM_RELAY_OFF_LEVEL` in `Core/Src/main.c`.
 
 ## Python CAN Tool
 
@@ -286,4 +364,3 @@ rostopic echo /bottom_can/raw_frame
 ```
 
 If raw frame data is zero, ROS is decoding correctly and the STM32 payload is zero.
-

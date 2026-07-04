@@ -68,6 +68,8 @@ void Error_Handler(void);
 #define RCC_OSC_IN_GPIO_Port GPIOF
 #define RCC_OSC_OUT_Pin GPIO_PIN_1
 #define RCC_OSC_OUT_GPIO_Port GPIOF
+#define BRAKE_Pin GPIO_PIN_1
+#define BRAKE_GPIO_Port GPIOB
 #define SPI2_RST_Pin GPIO_PIN_10
 #define SPI2_RST_GPIO_Port GPIOB
 #define SPI2_INT_Pin GPIO_PIN_11
