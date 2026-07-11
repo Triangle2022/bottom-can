@@ -141,8 +141,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    CEVA_BNO085_Service();
     Bottom_CAN_Service();
+    CEVA_BNO085_Service();
   }
   /* USER CODE END 3 */
 }

@@ -10,7 +10,7 @@
 #include "sh2_hal.h"
 
 #define BNO085_SPI_TIMEOUT_MS 100U
-#define BNO085_INT_TIMEOUT_MS 500U
+#define BNO085_INT_TIMEOUT_MS 2U
 #define BNO085_RESET_DELAY_MS 10U
 #define BNO085_REPORT_INTERVAL_US 10000U
 #define BNO085_RAD_TO_DEG 57.29577951308232f
@@ -539,7 +539,10 @@ void CEVA_BNO085_Service(void)
 
   run_auto_startup();
 
-  if (stream_enabled && sh2_is_open) {
+  /* sh2_service() may call hal_read(), which waits for the active-low INT.
+   * Do not enter it unless the device has already signalled data ready; this
+   * keeps unrelated main-loop services (notably CAN) from being stalled. */
+  if (stream_enabled && sh2_is_open && int_asserted()) {
     sh2_service();
     bno085_dbg.service_count++;
   }
